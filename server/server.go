@@ -2,16 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
-	"fmt"
 	pb "kv-store/proto"
 	"kv-store/store"
 	"log"
 	"net"
-	"strings"
-	"sync"
+	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/hashicorp/raft"
+	"github.com/hashicorp/raft-boltdb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -20,120 +22,169 @@ import (
 
 type Node struct {
 	pb.UnimplementedKeyValueStoreServer
-	pb.UnimplementedReplicationServer
-	mu               sync.RWMutex
-	store            *store.Store
-	isLeader         bool
-	replicationPeers map[string]pb.ReplicationClient
+	raft *raft.Raft
+	fsm  *store.Store
 }
 
-func NewNode(isLeader bool) *Node {
+func NewNode(fsm *store.Store) *Node {
 	return &Node{
-		store:            store.NewStore(),
-		isLeader:         isLeader,
-		replicationPeers: make(map[string]pb.ReplicationClient),
-	}
-}
-
-func (n *Node) connectToPeers(peerAddrs []string) {
-	for _, addr := range peerAddrs {
-		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.Printf("Failed to connect to peer %s: %v", addr, err)
-			continue
-		}
-		client := pb.NewReplicationClient(conn)
-		n.replicationPeers[addr] = client
-		log.Printf("Connected to peer %s", addr)
+		fsm: fsm,
 	}
 }
 
 func (n *Node) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse, error) {
-	if !n.isLeader {
-		return nil, status.Error(codes.FailedPrecondition, "this node is not the leader")
+	if n.raft.State() != raft.Leader {
+		return nil, status.Error(codes.FailedPrecondition, "not leader")
 	}
-	n.store.Set(req.Key, req.Value)
-	log.Printf("LEADER: Set key=%s, value=%s", req.Key, req.Value)
-	for peerAddr, peerClient := range n.replicationPeers {
-		go func(addr string, client pb.ReplicationClient) {
-			repl_req := &pb.ReplicateRequest{Key: req.Key, Value: req.Value, Operation: pb.ReplicateRequest_SET}
-			_, err := client.Replicate(context.Background(), repl_req)
-			if err != nil {
-				log.Printf("Failed to replicate to peer %s: %v", addr, err)
-			}
-		}(peerAddr, peerClient)
+
+	cmd := &store.Command{
+		Op:    "set",
+		Key:   req.Key,
+		Value: req.Value,
+	}
+	b, err := json.Marshal(cmd)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "failed to marshal command")
+	}
+	future := n.raft.Apply(b, 500*time.Millisecond)
+	if err := future.Error(); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to apply command: %s", err)
 	}
 	return &pb.SetResponse{Ok: true}, nil
 }
 
 func (n *Node) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
-	if !n.isLeader {
-		return nil, status.Error(codes.FailedPrecondition, "this node is not leader")
+	if n.raft.State() != raft.Leader {
+		return nil, status.Error(codes.FailedPrecondition, "not leader")
 	}
-	n.store.Delete(req.Key)
-	log.Printf("LEADER: Delete key=%s", req.Key)
-	for peerAddr, peerClient := range n.replicationPeers {
-		go func(addr string, client pb.ReplicationClient) {
-			repl_req := &pb.ReplicateRequest{Key: req.Key, Value: "", Operation: pb.ReplicateRequest_DELETE}
-			_, err := client.Replicate(context.Background(), repl_req)
-			if err != nil {
-				log.Printf("failec to replicate to peer %s: %v", addr, err)
-			}
-		}(peerAddr, peerClient)
+
+	cmd := &store.Command{
+		Op:  "delete",
+		Key: req.Key,
+	}
+	b, err := json.Marshal(cmd)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "failed to marshal command")
+	}
+	future := n.raft.Apply(b, 500*time.Millisecond)
+	if err := future.Error(); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to apply command: %s", err)
 	}
 	return &pb.DeleteResponse{Ok: true}, nil
 }
 
-func (n *Node) Replicate(ctx context.Context, req *pb.ReplicateRequest) (*pb.ReplicateResponse, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	switch req.Operation {
-	case pb.ReplicateRequest_DELETE:
-		n.store.Delete(req.Key)
-		log.Printf("Delete replicate on for key=%s\n", req.Key)
-		return &pb.ReplicateResponse{Ok: true}, nil
-	case pb.ReplicateRequest_SET:
-		n.store.Set(req.Key, req.Value)
-		log.Printf("Replicate set for key=%s with value=%s\n", req.Key, req.Value)
-		return &pb.ReplicateResponse{Ok: true}, nil
-	default:
-		panic(fmt.Sprintf("unexpected proto.ReplicateRequest_OpType: %#v", req.Operation))
-	}
-}
-
 func (n *Node) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
-	value, ok := n.store.Get(req.Key)
+	val, ok := n.fsm.Get(req.Key)
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "key %s not found", req.Key)
 	}
-	return &pb.GetResponse{Value: value}, nil
+	return &pb.GetResponse{Value: val}, nil
+}
+
+func (n *Node) Join(ctx context.Context, req *pb.JoinRequest) (*pb.JoinResponse, error) {
+	log.Printf("received join request for node %s at %s", req.NodeId, req.RaftAddr)
+	if n.raft.State() != raft.Leader {
+		return nil, status.Error(codes.FailedPrecondition, "not the leader")
+	}
+	future := n.raft.AddVoter(raft.ServerID(req.NodeId), raft.ServerAddress(req.RaftAddr), 0, 0)
+	if err := future.Error(); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to add voter: %s", err)
+	}
+	return &pb.JoinResponse{Ok: true}, nil
 }
 
 func main() {
-	port := flag.String("port", "50051", "Server port")
-	isLeader := flag.Bool("leader", false, "Is this node the leader?")
-	peerList := flag.String("peers", "", "Comma-separated list of peer addresses (e.g localhost:50052,localhost:50053)")
+	grpcPort := flag.String("grpcport", "50051", "gRPC server port")
+	raftPort := flag.String("raftport", "60051", "Raft server port")
+	nodeID := flag.String("id", "node1", "Node ID")
+	bootstrap := flag.Bool("bootstrap", false, "Bootstrap the cluster")
+	joinAddr := flag.String("join", "", "Address of a node to join")
 	flag.Parse()
 
-	addr := "localhost:" + *port
-	lis, err := net.Listen("tcp", ":"+*port)
-	if err != nil {
-		log.Fatal("could not listen")
+	dataDir := "data/" + *nodeID
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		log.Fatalf("failed to create data dir: %s", err)
 	}
-	node := NewNode(*isLeader)
-	go func() {
-		time.Sleep(5 * time.Second)
-		if *peerList != "" {
-			peers := strings.Split(*peerList, ",")
-			node.connectToPeers(peers)
+
+	fsm := store.NewStore()
+
+	config := raft.DefaultConfig()
+	config.LocalID = raft.ServerID(*nodeID)
+
+	logStore, err := raftboltdb.NewBoltStore(filepath.Join(dataDir, "logs.dat"))
+	if err != nil {
+		log.Fatalf("failed to create log store: %s", err)
+	}
+
+	stableStore, err := raftboltdb.NewBoltStore(filepath.Join(dataDir, "stable.dat"))
+	if err != nil {
+		log.Fatalf("failed to create stable store: %s", err)
+	}
+
+	snapshotStore, err := raft.NewFileSnapshotStore(dataDir, 2, os.Stderr)
+	if err != nil {
+		log.Fatalf("failed to create snapshot store: %s", err)
+	}
+
+	raftAddr := "localhost:" + *raftPort
+	transport, err := raft.NewTCPTransport(raftAddr, nil, 3, 10*time.Second, os.Stderr)
+	if err != nil {
+		log.Fatalf("failed to create transport: %s", err)
+	}
+
+	raftNode, err := raft.NewRaft(config, fsm, logStore, stableStore, snapshotStore, transport)
+	if err != nil {
+		log.Fatalf("failed to create raft node: %s", err)
+	}
+
+	if *bootstrap {
+		configuration := raft.Configuration{
+			Servers: []raft.Server{
+				{
+					ID:      config.LocalID,
+					Address: transport.LocalAddr(),
+				},
+			},
 		}
-	}()
+		raftNode.BootstrapCluster(configuration)
+	}
+
+	node := NewNode(fsm)
+	node.raft = raftNode
+
+	lis, err := net.Listen("tcp", ":"+*grpcPort)
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
 
 	grpcServer := grpc.NewServer()
 	pb.RegisterKeyValueStoreServer(grpcServer, node)
-	pb.RegisterReplicationServer(grpcServer, node)
-	log.Printf("Server starting on %s. Leader: %v", addr, *isLeader)
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("failed to serve: %v", err)
+	log.Printf("grpc server starting on port %s", *grpcPort)
+
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("failed to serve: %s", err)
+		}
+	}()
+
+	if *joinAddr != "" {
+		go func() {
+			time.Sleep(3 * time.Second)
+			conn, err := grpc.NewClient(*joinAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				log.Fatalf("failed to connect to join addr: %v", err)
+			}
+			defer conn.Close()
+			client := pb.NewKeyValueStoreClient(conn)
+			_, err = client.Join(context.Background(), &pb.JoinRequest{
+				NodeId:   *nodeID,
+				RaftAddr: raftAddr,
+			})
+			if err != nil {
+				log.Fatalf("failed to join cluster: %v", err)
+			}
+			log.Printf("succesfully joined cluster at %s", *joinAddr)
+		}()
 	}
+	select {}
 }

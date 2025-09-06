@@ -6,23 +6,16 @@ service KeyValueStore {
   rpc Set(SetRequest) returns (SetResponse) {}
   rpc Get(GetRequest) returns (GetResponse) {}
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}
+
+  rpc Join(JoinRequest) returns (JoinResponse) {}
 }
 
-service Replication {
-  rpc Replicate(ReplicateRequest) returns (ReplicateResponse) {}
+message JoinRequest {
+  string node_id = 1;
+  string raft_addr = 2;
 }
 
-message ReplicateRequest {
-  string key = 1;
-  string value = 2;
-  enum OpType {
-    SET = 0;
-    DELETE = 1;
-  }
-  OpType operation = 3;
-}
-
-message ReplicateResponse { bool ok = 1; }
+message JoinResponse { bool ok = 1; }
 
 message SetRequest {
   string key = 1;
