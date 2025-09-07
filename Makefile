@@ -15,6 +15,7 @@ proto:
 
 clean: 
 	rm -rf bin
+	rm -rf data
 	rm proto/*.go
 
 deps:
