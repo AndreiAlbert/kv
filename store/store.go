@@ -3,6 +3,8 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"maps"
 	"sync"
 
 	"github.com/hashicorp/raft"
@@ -61,6 +63,22 @@ func (s *Store) Apply(log *raft.Log) any {
 	}
 }
 
+func (s *Store) Restore(reader io.ReadCloser) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	b, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+	var data map[string]string
+	if err := json.Unmarshal(b, &data); err != nil {
+		return err
+	}
+	s.data = data
+	return nil
+}
+
 type fsmSnapshot struct {
 	data map[string]string
 }
@@ -70,9 +88,7 @@ func (s *Store) Snapshot() (raft.FSMSnapshot, error) {
 	defer s.mu.RUnlock()
 
 	o := make(map[string]string)
-	for k, v := range s.data {
-		o[k] = v
-	}
+	maps.Copy(o, s.data)
 	return &fsmSnapshot{data: o}, nil
 }
 

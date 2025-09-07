@@ -1,5 +1,6 @@
 syntax = "proto3";
 package proto;
+
 option go_package = "kv-store/proto";
 
 service KeyValueStore {
@@ -10,24 +11,54 @@ service KeyValueStore {
   rpc Join(JoinRequest) returns (JoinResponse) {}
 }
 
+service Replication {
+  rpc Replicate(ReplicateRequest) returns (ReplicateResponse) {}
+}
+
+message ReplicateRequest {
+  enum OpTYpe {
+    SET = 0;
+    DELETE = 1;
+  }
+  string key = 1;
+  string value = 2;
+  OpTYpe operation = 3;
+}
+
+message ReplicateResponse {
+  bool ok = 1;
+}
+
 message JoinRequest {
   string node_id = 1;
   string raft_addr = 2;
 }
 
-message JoinResponse { bool ok = 1; }
+message JoinResponse {
+  bool ok = 1;
+}
 
 message SetRequest {
   string key = 1;
   string value = 2;
 }
 
-message SetResponse { bool ok = 1; }
+message SetResponse {
+  bool ok = 1;
+}
 
-message GetRequest { string key = 1; }
+message GetRequest {
+  string key = 1;
+}
 
-message GetResponse { string value = 1; }
+message GetResponse {
+  string value = 1;
+}
 
-message DeleteRequest { string key = 1; }
+message DeleteRequest {
+  string key = 1;
+}
 
-message DeleteResponse { bool ok = 1; }
+message DeleteResponse {
+  bool ok = 1;
+}
