@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"flag"
 	pb "kv-store/proto"
 	"log"
-	"os"
 	"time"
 
 	"google.golang.org/grpc"
@@ -12,54 +12,60 @@ import (
 )
 
 func main() {
-	conn, err := grpc.NewClient("localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	serverAddr := flag.String("server", "localhost:50051", "server address to connect to")
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) < 2 {
+		log.Fatalf("Usage: client [-server=address] [get|set|delete] [key] [value]")
+	}
+
+	conn, err := grpc.NewClient(*serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("did not connect: %v", err)
 	}
 	defer conn.Close()
 
 	client := pb.NewKeyValueStoreClient(conn)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
-	if len(os.Args) < 2 {
-		log.Fatalf("Usage: go run client.go [get|set|delete] [key] [value]")
-	}
+	log.Printf("Connecting to server: %s", *serverAddr)
 
-	action := os.Args[1]
+	action := args[0]
 	switch action {
 	case "get":
-		if len(os.Args) != 3 {
-			log.Fatal("Usage: go run client.go get [key]")
+		if len(args) != 2 {
+			log.Fatal("Usage: client [-server=address] get [key]")
 		}
-		key := os.Args[2]
+		key := args[1]
 		res, err := client.Get(ctx, &pb.GetRequest{Key: key})
 		if err != nil {
 			log.Fatalf("Could not get value: %v", err)
 		}
 		log.Printf("Got value: %s", res.Value)
 	case "set":
-		if len(os.Args) != 4 {
-			log.Fatal("Usage: go run client.go set [key] [value]")
+		if len(args) != 3 {
+			log.Fatal("Usage: client [-server=address] set [key] [value]")
 		}
-		key := os.Args[2]
-		val := os.Args[3]
+		key := args[1]
+		val := args[2]
 		_, err := client.Set(ctx, &pb.SetRequest{Key: key, Value: val})
 		if err != nil {
-			log.Fatalf("Could not set value %s", err)
+			log.Fatalf("Could not set value: %s", err)
 		}
-		log.Printf("Succesfully set key %s to value %s", key, val)
+		log.Printf("Successfully set key %s to value %s", key, val)
 	case "delete":
-		if len(os.Args) != 3 {
-			log.Fatal("Usage: go run client.go delete [key]")
+		if len(args) != 2 {
+			log.Fatal("Usage: client [-server=address] delete [key]")
 		}
-		key := os.Args[2]
+		key := args[1]
 		_, err := client.Delete(ctx, &pb.DeleteRequest{Key: key})
 		if err != nil {
 			log.Fatalf("Could not delete key: %s", err)
 		}
-		log.Printf("Delete key %s", key)
+		log.Printf("Deleted key %s", key)
 	default:
-		log.Fatal("unkown action: Use: get, set, delete")
+		log.Fatal("Unknown action: Use: get, set, delete")
 	}
 }
