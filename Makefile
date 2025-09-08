@@ -3,7 +3,7 @@
 build: build_server build_client
 
 build_server: proto
-	go build -o bin/server server/server.go
+	go build -o bin/server cmd/server/main.go
 
 build_client: proto
 	go build -o bin/client client/client.go
